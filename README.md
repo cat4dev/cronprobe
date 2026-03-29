@@ -26,7 +26,7 @@ Operators running bash scripts, DB backups, or Python scrapers on Virtual Privat
 ### Installation
 Download the script to your target server and make it executable:
 ```bash
-sudo curl -L -o /usr/local/bin/cronprobe https://raw.githubusercontent.com/username/cronprobe/main/cronprobe
+sudo curl -L -o /usr/local/bin/cronprobe https://raw.githubusercontent.com/cat4dev/cronprobe/main/cronprobe
 sudo chmod +x /usr/local/bin/cronprobe
 ```
 
