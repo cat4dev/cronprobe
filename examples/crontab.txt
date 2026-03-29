@@ -1,0 +1,12 @@
+# Example 1: Passing the webhook URL via command line argument for a database backup
+0 2 * * * cronprobe --webhook="https://discord.com/api/webhooks/..." -- /usr/local/bin/backup-postgres.sh
+
+# Example 2: Using the CRONPROBE_WEBHOOK environment variable to keep the crontab entries cleaner
+CRONPROBE_WEBHOOK="https://hooks.slack.com/services/T0000/B0000/XXXX"
+30 * * * * cronprobe -- /usr/bin/python3 /var/scripts/price_scraper.py
+15 4 * * * cronprobe -- /usr/bin/node /opt/app/scripts/cleanup_stale_sessions.js
+
+# Example 3: Wrapping an inline bash command string
+# WARNING: Do not put secrets or API tokens in this command string. They will be sent to the webhook if the job fails.
+# WARNING: Ensure your scripts do not print secrets to stdout/stderr upon crashing, as they will also be captured.
+0 0 * * 0 cronprobe --webhook="https://hooks.slack.com/services/..." -- bash -c '/usr/local/bin/certbot renew --quiet'

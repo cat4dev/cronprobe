@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# cronprobe - A minimal-dependency bash wrapper to catch and alert on failing cron jobs.
+
+set -o pipefail
+
+WEBHOOK_URL="${CRONPROBE_WEBHOOK:-}"
+DESTINATION=""
+
+show_help() {
+    cat << EOF
+Usage: cronprobe [options] -- <command> [args...]
+
+Options:
+  --webhook URL    Webhook URL for Slack, Discord, Ntfy, or any generic webhook
+  --slack          Force Slack formatting
+  --discord        Force Discord formatting
+  --ntfy           Force Ntfy formatting (plain-text)
+  --generic        Force generic JSON webhook formatting
+  -h, --help       Show this help message
+
+SECURITY WARNING & DATA LEAKAGE:
+  On failure, cronprobe sends the target command string and its last 50 lines 
+  of stdout/stderr directly to the configured webhook. 
+  - Do NOT pass plaintext secrets (passwords, tokens) as command arguments. Use environment variables.
+  - cronprobe alters native cron behavior: it swallows output on success, but prints it on failure.
+
+Example:
+  cronprobe --webhook="https://hooks.slack.com/..." -- python3 scraper.py
+EOF
+}
+
+# Parse arguments cleanly
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --webhook=*) 
+            WEBHOOK_URL="${1#*=}"
+            if [[ -z "$WEBHOOK_URL" ]]; then
+                echo "cronprobe error: --webhook requires a URL argument." >&2
+                exit 1
+            fi
+            shift ;;
+        --webhook) 
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "cronprobe error: --webhook requires a URL argument." >&2
+                exit 1
+            fi
+            WEBHOOK_URL="$2"; shift 2 ;;
+        --slack) DESTINATION="slack"; shift ;;
+        --discord) DESTINATION="discord"; shift ;;
+        --ntfy) DESTINATION="ntfy"; shift ;;
+        --generic) DESTINATION="generic"; shift ;;
+        -h|--help) show_help; exit 0 ;;
+        --) shift; break ;;
+        -*) echo "cronprobe error: Unknown option: $1" >&2; show_help >&2; exit 1 ;;
+        *) break ;; # Found start of command
+    esac
+done
+
+if [[ "$#" -eq 0 ]]; then
+    echo "cronprobe error: No command provided." >&2
+    show_help >&2
+    exit 1
+fi
+
+COMMAND=("$@")
+# Clean quoting for array print to prevent log misdirection
+printf -v COMMAND_STR '%q ' "${COMMAND[@]}"
+COMMAND_STR="${COMMAND_STR% }"
+
+# If no webhook is configured, execute transparently avoiding overhead proxying
+if [[ -z "$WEBHOOK_URL" ]]; then
+    exec "${COMMAND[@]}"
+fi
+
+# Auto-detect webhook type
+if [[ -z "$DESTINATION" ]]; then
+    if [[ "$WEBHOOK_URL" == *"discord.com"* ]]; then
+        DESTINATION="discord"
+    elif [[ "$WEBHOOK_URL" == *"ntfy.sh"* ]]; then
+        DESTINATION="ntfy"
+    elif [[ "$WEBHOOK_URL" == *"hooks.slack.com"* ]]; then
+        DESTINATION="slack"
+    else
+        DESTINATION="generic"
+    fi
+fi
+
+# Set up bounded ephemeral storage that cleans itself up safely cross-platform
+TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/cronprobe.XXXXXX") || exit 1
+trap 'rm -f "$TMP_OUT"' EXIT
+
+START_TIME=$(date +%s)
+
+# Execute the target command, capturing all output 
+"${COMMAND[@]}" > "$TMP_OUT" 2>&1
+EXIT_CODE=$?
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+# We only care if it failed. Exit 0 -> exit 0 quietly.
+if [[ $EXIT_CODE -ne 0 ]]; then
+    # Re-emit the captured output so the native cron daemon can still email it
+    cat "$TMP_OUT"
+    
+    HOSTNAME=$(hostname)
+    
+    # Grab the last 50 lines cleanly
+    if [[ -s "$TMP_OUT" ]]; then
+        OUTPUT=$(tail -n 50 "$TMP_OUT")
+        # Trim payload to a reasonable size for webhook delivery
+        OUTPUT="${OUTPUT:0:2000}"
+    else
+        OUTPUT="Process exited with code $EXIT_CODE and produced no output."
+    fi
+
+    # Robust pure-bash JSON string escaping (no jq dependency)
+    # Replaces \, ", \n, \r, \t, and safely strips problematic ANSI/control chars except \n and \t
+    escape_json() {
+        local str="$1"
+        str="${str//\\/\\\\}"         # backslashes
+        str="${str//\"/\\\"}"         # quotes
+        str="${str//$'\n'/\\n}"       # newlines
+        str="${str//$'\r'/}"          # carriage returns
+        str="${str//$'\t'/\\t}"       # tabs
+        # Strip ASCII control chars (0x00-0x1F) safely while preserving UTF-8 (0x80-0xFF)
+        printf '%s' "$str" | LC_ALL=C tr -d '\000-\010\013-\037\177'
+    }
+
+    SAFE_CMD=$(escape_json "$COMMAND_STR")
+    SAFE_OUT=$(escape_json "$OUTPUT")
+    SAFE_HOST=$(escape_json "$HOSTNAME")
+
+    # Format the payload
+    if [[ "$DESTINATION" == "discord" ]]; then
+        PAYLOAD=$(cat <<EOF
+{
+  "embeds": [{
+    "title": "🚨 [\`$SAFE_HOST\`] Job Failed",
+    "color": 16711680,
+    "description": "**Command:** \`$SAFE_CMD\`\n**Exit Code:** $EXIT_CODE | **Duration:** ${DURATION}s\n\n**Output (last 50 lines):**\n\`\`\`text\n$SAFE_OUT\n\`\`\`"
+  }]
+}
+EOF
+)
+    elif [[ "$DESTINATION" == "slack" ]]; then
+        PAYLOAD=$(cat <<EOF
+{
+  "blocks": [
+    {
+      "type": "header",
+      "text": { "type": "plain_text", "text": "🚨 [$SAFE_HOST] Job Failed", "emoji": true }
+    },
+    {
+      "type": "section",
+      "text": { "type": "mrkdwn", "text": "*Command:* \`$SAFE_CMD\`\n*Exit Code:* $EXIT_CODE | *Duration:* ${DURATION}s" }
+    },
+    {
+      "type": "section",
+      "text": { "type": "mrkdwn", "text": "*Output (last 50 lines):*\n\`\`\`\n$SAFE_OUT\n\`\`\`" }
+    }
+  ]
+}
+EOF
+)
+    elif [[ "$DESTINATION" == "ntfy" ]]; then
+        # ntfy takes regular plaintext formatting if POSTed directly
+        PAYLOAD="🚨 [$HOSTNAME] Job Failed
+Command: $COMMAND_STR
+Exit Code: $EXIT_CODE | Duration: ${DURATION}s
+
+Output (last 50 lines):
+$OUTPUT"
+    else
+        # generic webhook endpoint
+        PAYLOAD=$(cat <<EOF
+{
+  "status": "failed",
+  "host": "$SAFE_HOST",
+  "command": "$SAFE_CMD",
+  "exit_code": $EXIT_CODE,
+  "duration_seconds": $DURATION,
+  "output": "$SAFE_OUT"
+}
+EOF
+)
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "cronprobe error: curl is required but not installed." >&2
+        exit "$EXIT_CODE"
+    fi
+
+    CURL_HEADERS=(-H 'Content-Type: application/json')
+    if [[ "$DESTINATION" == "ntfy" ]]; then
+        CURL_HEADERS=(-H 'Content-Type: text/plain')
+    fi
+
+    # Deliver to webhook (surface network errors directly for rapid debugging)
+    HTTP_CODE=$(curl --max-time 10 -s -w "%{http_code}" -X POST "${CURL_HEADERS[@]}" -d "$PAYLOAD" "$WEBHOOK_URL" -o /dev/null || echo "curl_failed")
+    
+    if [[ "$HTTP_CODE" == *"curl_failed"* ]]; then
+        echo "cronprobe error: Webhook delivery failed (network or timeout error)" >&2
+    elif [[ "$HTTP_CODE" -ge 400 ]]; then
+        echo "cronprobe error: Webhook delivery failed with HTTP status $HTTP_CODE" >&2
+    fi
+fi
+
+# Pass the original exit code completely unmodified
+exit $EXIT_CODE
